@@ -14,9 +14,17 @@
   准备之后对旧坐标的删除映射至新位置，递增版本；同 job 发布重试幂等返回原版本。
 * 读取  POST /read     {version}：返回该版本完整快照，按文件 ASCII 序、行号排序，
   保留重复值与 null；历史版本永久可读（文件与墓碑均不回收）。
+* 擦除  POST /erase    {version, positions}：样本撤回。按压实来源（job_mapping）识别
+  逻辑行身份，把目标行在【全部世代】的物理副本（历史输入文件、当前文件、已准备
+  未发布的 ~job 输出、以及其后压实会继承的副本）中的值就地改写为 null；坐标与
+  墓碑可见性不变，同值的其他行不受影响。不增版本，返回去重后的行数。
+  擦除意图先持久化到 SQLite，再逐文件原子改写 Parquet；强退后启动时先补完擦除
+  才对外服务，因此待定发布也不可能复活原值。
 * 非法 JSON / 未知或重复成员 / 类型错误 / 引用错误 -> 400，报任一 JSON 路径；
   标识（file/job）复用 -> 409；被拒绝的请求不改变任何状态。
 * 所有落盘遵循“文件及映射先落盘、SQLite 单事务原子提交”，强退前后恢复为完整旧版/新版。
+* 写操作（append/delete/prepare/publish/erase）互斥串行；读取持共享锁，故任何读写
+  与擦除都串行等价（读不会观察到“部分文件已擦除”的中间态）。
 
 存储布局（数据目录可通过 --data 指定）：
     data/meta.sqlite        元数据、墓碑、作业、位置映射（WAL + synchronous=FULL）
@@ -32,9 +40,10 @@ import re
 import signal
 import sqlite3
 import threading
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -177,6 +186,74 @@ def _require_members(obj: dict[str, Any], allowed: set[str], where: str = "$") -
         raise ApiError(400, f"未知成员 {key!r}", _member_path(where, key))
 
 
+def _parse_positions(value: Any, where: str) -> list[tuple[str, int]]:
+    """解析 [[file, pos], ...]（/delete 与 /erase 共用同一坐标格式）。"""
+    if not isinstance(value, list):
+        raise ApiError(400, "positions 必须是数组", where)
+    parsed: list[tuple[str, int]] = []
+    for i, item in enumerate(value):
+        p = _index_path(where, i)
+        if not isinstance(item, list) or len(item) != 2:
+            raise ApiError(400, "位置项必须是形如 [file, pos] 的二元数组", p)
+        file_id, pos = item[0], item[1]
+        if not isinstance(file_id, str):
+            raise ApiError(400, "位置项的 file 必须是字符串", _index_path(p, 0))
+        # 布尔不是合法位置
+        if isinstance(pos, bool) or not isinstance(pos, int):
+            raise ApiError(400, "位置项的 pos 必须是整数", _index_path(p, 1))
+        if pos < 0:
+            raise ApiError(400, "pos 必须是零基非负整数", _index_path(p, 1))
+        parsed.append((file_id, pos))
+    return parsed
+
+
+class _RWLock:
+    """公平的读者-写者锁：写者互斥，读者可并发，写者优先。
+
+    用于“写操作（含擦除）串行等价、读取不可见中间态”的语义：
+    擦除会改写多个 Parquet 文件，若读取并发进行就可能看到“部分文件已擦除”，
+    因此读也持共享锁，使每一次读与每次擦除/写完全串行等价。
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._waiting_writers = 0
+
+    @contextmanager
+    def read(self) -> Iterator[None]:
+        with self._cond:
+            # 有等待中的写者时让路，避免写者饥饿
+            while self._writer or self._waiting_writers > 0:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextmanager
+    def write(self) -> Iterator[None]:
+        with self._cond:
+            self._waiting_writers += 1
+            try:
+                while self._writer or self._readers > 0:
+                    self._cond.wait()
+            finally:
+                self._waiting_writers -= 1
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer = False
+                self._cond.notify_all()
+
+
 class Store:
     """SQLite 元数据 + Parquet 数据文件。所有写操作经全局锁串行化。"""
 
@@ -185,12 +262,14 @@ class Store:
         self.parquet_dir = self.data_dir / "parquet"
         self.parquet_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "meta.sqlite"
-        self._write_lock = threading.Lock()
+        self._write_lock = _RWLock()
         self._local = threading.local()
         self._init_schema()
         self._cleanup_orphan_files()
+        self._recover_pending_erasures()
         # 故障注入（仅用于验收强退恢复）：取值为
-        #   prepare_write / publish_before_commit / publish_after_commit
+        #   prepare_write / publish_before_commit / publish_after_commit /
+        #   erase_after_intent / erase_mid_rewrite / erase_after_rewrites
         # 一次性：触发后立即从环境移除，避免重启后的新进程在同阶段再次崩溃。
         self.crash_points: set[str] = set()
         crash = os.environ.get("LAKECOMP_CRASH", "")
@@ -205,6 +284,16 @@ class Store:
             self.crash_points.discard(point)
             os.environ.pop("LAKECOMP_CRASH", None)
             os._exit(137)
+
+    def _drain_pending_erasures(self, conn: sqlite3.Connection,
+                                inject_crash: bool = False) -> None:
+        """幂等重放所有 pending 擦除意图，并置 done。
+
+        正常情形下调用时无 pending（空查询开销极小）。若上一次请求在改写中途
+        遭遇非强退异常（如磁盘错误）而留下 pending，则在下一次写操作前补完。
+        """
+        for r in conn.execute("SELECT id FROM erasures WHERE state='pending'").fetchall():
+            self._apply_erase(conn, int(r["id"]), inject_crash=inject_crash)
 
     # ------------------------------------------------------------------ 连接
     def _conn(self) -> sqlite3.Connection:
@@ -272,6 +361,29 @@ class Store:
                 new_pos   INTEGER NOT NULL,
                 PRIMARY KEY (job, old_file, old_pos)
             ) WITHOUT ROWID;
+
+            -- 擦除意图日志：先落库（pending），逐文件改写值后再置 done。
+            -- 强退后启动时据此补完擦除（幂等），完成后才对外服务。
+            CREATE TABLE IF NOT EXISTS erasures (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                state   TEXT NOT NULL CHECK (state IN ('pending', 'done')),
+                version INTEGER NOT NULL,
+                nrows   INTEGER NOT NULL,
+                created_ver INTEGER NOT NULL
+            );
+            -- 每个逻辑行在其全部世代的所有物理单元格（file, pos）。
+            CREATE TABLE IF NOT EXISTS erase_cells (
+                erase_id INTEGER NOT NULL,
+                file     TEXT NOT NULL,
+                pos      INTEGER NOT NULL,
+                PRIMARY KEY (erase_id, file, pos)
+            ) WITHOUT ROWID;
+
+            -- 血缘回溯/下降所用的映射索引。
+            CREATE INDEX IF NOT EXISTS idx_mapping_old
+                ON job_mapping (old_file, old_pos);
+            CREATE INDEX IF NOT EXISTS idx_mapping_new
+                ON job_mapping (job, new_pos);
             """
         )
 
@@ -303,7 +415,7 @@ class Store:
     def _rollback(conn: sqlite3.Connection) -> None:
         """异常路径上的兜底回滚：回滚自身失败不应掩盖原始异常。"""
         try:
-            self._rollback(conn)
+            conn.execute("ROLLBACK")
         except sqlite3.Error:
             pass
 
@@ -349,8 +461,9 @@ class Store:
             else:
                 values.append(v)
 
-        with self._write_lock:
+        with self._write_lock.write():
             conn = self._conn()
+            self._drain_pending_erasures(conn)  # 未完成的擦除必须先补完
             # 标识永不复用：即使文件已被替换也拒绝
             exists = conn.execute("SELECT 1 FROM files WHERE id=?", (file_id,)).fetchone()
             if exists:
@@ -376,26 +489,11 @@ class Store:
         if "positions" not in obj:
             raise ApiError(400, "缺少成员 positions", "$.positions")
         positions = obj["positions"]
-        if not isinstance(positions, list):
-            raise ApiError(400, "positions 必须是数组", "$.positions")
+        parsed = _parse_positions(positions, "$.positions")
 
-        parsed: list[tuple[str, int]] = []
-        for i, item in enumerate(positions):
-            p = _index_path("$.positions", i)
-            if not isinstance(item, list) or len(item) != 2:
-                raise ApiError(400, "位置项必须是形如 [file, pos] 的二元数组", p)
-            file_id, pos = item[0], item[1]
-            if not isinstance(file_id, str):
-                raise ApiError(400, "位置项的 file 必须是字符串", _index_path(p, 0))
-            # 布尔不是合法位置
-            if isinstance(pos, bool) or not isinstance(pos, int):
-                raise ApiError(400, "位置项的 pos 必须是整数", _index_path(p, 1))
-            if pos < 0:
-                raise ApiError(400, "pos 必须是零基非负整数", _index_path(p, 1))
-            parsed.append((file_id, pos))
-
-        with self._write_lock:
+        with self._write_lock.write():
             conn = self._conn()
+            self._drain_pending_erasures(conn)  # 未完成的擦除必须先补完
             # 先在锁内做全部引用校验：当前文件界内。拒绝则不改任何状态。
             for i, (file_id, pos) in enumerate(parsed):
                 row = conn.execute(
@@ -445,8 +543,10 @@ class Store:
                 raise ApiError(400, "files 元素必须是字符串（文件号）",
                                _index_path("$.files", i))
 
-        with self._write_lock:
+        with self._write_lock.write():
             conn = self._conn()
+            # 未完成的擦除必须先补完：prepare 会复制行值，若源尚未擦除则会复活原值。
+            self._drain_pending_erasures(conn)
             if conn.execute("SELECT 1 FROM jobs WHERE job=?", (job,)).fetchone():
                 # 标识永不复用（含已发布的 job）
                 raise ApiError(409, f"作业标识 {job!r} 已被使用，永不复用", "$.job")
@@ -529,8 +629,10 @@ class Store:
         if not isinstance(job, str):
             raise ApiError(400, "job 必须是字符串", "$.job")
 
-        with self._write_lock:
+        with self._write_lock.write():
             conn = self._conn()
+            # 未完成的擦除必须先补完：待定发布不得复活原值。
+            self._drain_pending_erasures(conn)
             row = conn.execute("SELECT * FROM jobs WHERE job=?", (job,)).fetchone()
             if row is None:
                 raise ApiError(400, f"未知作业 {job!r}", "$.job")
@@ -595,6 +697,223 @@ class Store:
 
             self._crash("publish_after_commit")
         return {"version": version}
+
+    # ------------------------------------------------------------------ 擦除
+    def _identity_cells(
+        self, conn: sqlite3.Connection, file_id: str, pos: int
+    ) -> set[tuple[str, int]]:
+        """按压实来源（job_mapping）收集同一逻辑行在全部世代的物理单元格。
+
+        映射边 (old_file, old_pos) <-> ("~"+job, new_pos) 是无向的：
+        * 向上（祖先）：目标文件是压实输出 ~job 时，经由 new_pos 回溯输入行；
+        * 向下（后代）：目标坐标是某作业的输入行时，经由 (old_file, old_pos) 找到
+          该作业输出的副本（含已准备未发布、以及已发布的输出）。
+        BFS 到不动点即得该逻辑行的全部物理副本；无关文件/同值其他行不在同一连通分量。
+        """
+        seen: set[tuple[str, int]] = {(file_id, pos)}
+        stack = [(file_id, pos)]
+        while stack:
+            f, p = stack.pop()
+            # 向上：f 是 "~job" 输出，找它在准备时来自哪些输入坐标
+            if f.startswith("~"):
+                job = f[1:]
+                for r in conn.execute(
+                    "SELECT old_file, old_pos FROM job_mapping "
+                    "WHERE job=? AND new_pos=?",
+                    (job, p),
+                ):
+                    cell = (r["old_file"], int(r["old_pos"]))
+                    if cell not in seen:
+                        seen.add(cell)
+                        stack.append(cell)
+            # 向下：f 的该行被哪些作业复制（不论其是否已发布）
+            for r in conn.execute(
+                "SELECT job, new_pos FROM job_mapping "
+                "WHERE old_file=? AND old_pos=?",
+                (f, p),
+            ):
+                cell = ("~" + r["job"], int(r["new_pos"]))
+                if cell not in seen:
+                    seen.add(cell)
+                    stack.append(cell)
+        return seen
+
+    def _remove_file_temps(self, file_id: str) -> None:
+        """删除该文件残留的临时副本（其中可能含目标行原值的可解码片段）。"""
+        prefix = f"{file_id}.tmp."
+        for entry in self.parquet_dir.iterdir():
+            if entry.name.startswith(prefix):
+                entry.unlink()
+
+    def _rewrite_cells_to_null(self, file_id: str, target_pos: set[int]) -> None:
+        """把该 Parquet 文件中目标单元格的值置 null，并以解码结果复核。
+
+        只改动目标单元格，其余行（即便取值相同）逐行保持原值；文件行数与坐标不变。
+        先删残留临时副本 → 原子改写（.tmp + fsync + os.replace + 目录 fsync）→
+        再删残留临时副本 → 解码新文件确认目标单元格为 null。
+        """
+        path = self._file_path(file_id)
+        table = pq.read_table(path, columns=["value"])
+        values = table.column("value").to_pylist()
+        for p in target_pos:
+            if p < 0 or p >= len(values):
+                raise RuntimeError(f"擦除单元格越界: {file_id}[{p}] nrows={len(values)}")
+            values[p] = None
+        self._remove_file_temps(file_id)
+        self._atomic_write_parquet(file_id, values)
+        self._remove_file_temps(file_id)
+        decoded = pq.read_table(path, columns=["value"]).column("value").to_pylist()
+        if len(decoded) != len(values):
+            raise RuntimeError(f"擦除后行数变化: {file_id}")
+        for p in target_pos:
+            if decoded[p] is not None:
+                raise RuntimeError(f"擦除未生效: {file_id}[{p}] 解码后仍为 {decoded[p]!r}")
+
+    def _apply_erase(self, conn: sqlite3.Connection, erase_id: int,
+                     inject_crash: bool = True) -> None:
+        """执行已持久化的擦除意图：逐文件改写目标单元格，全部完成后置 done。
+
+        幂等：重复执行只会把已经是 null 的单元格再次置 null。中途强退后由启动
+        恢复流程再次调用本函数，故“擦除意图落库之后”的任何强退都会补完擦除。
+        """
+        rows = conn.execute(
+            "SELECT file, pos FROM erase_cells WHERE erase_id=?", (erase_id,)
+        ).fetchall()
+        grouped: dict[str, set[int]] = {}
+        for r in rows:
+            grouped.setdefault(r["file"], set()).add(int(r["pos"]))
+
+        if inject_crash:
+            self._crash("erase_after_intent")
+        for file_id in sorted(grouped):
+            self._rewrite_cells_to_null(file_id, grouped[file_id])
+            if inject_crash:
+                self._crash("erase_mid_rewrite")
+        if inject_crash:
+            self._crash("erase_after_rewrites")
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("UPDATE erasures SET state='done' WHERE id=?", (erase_id,))
+            conn.execute("COMMIT")
+        except BaseException:
+            self._rollback(conn)
+            raise
+
+    def _recover_pending_erasures(self) -> None:
+        """启动时补完所有 pending 擦除（须在开始服务之前调用）。
+
+        意图已提交但尚未改写/未置 done 的擦除在此幂等重放，完成后才允许监听，
+        因此重启后不会短暂地把原值或“部分擦除”暴露给客户端。
+        """
+        conn = self._conn()
+        with self._write_lock.write():
+            self._drain_pending_erasures(conn)
+
+    def erase(self, obj: dict[str, Any]) -> dict[str, Any]:
+        _require_members(obj, {"version", "positions"})
+        if "version" not in obj:
+            raise ApiError(400, "缺少成员 version", "$.version")
+        if "positions" not in obj:
+            raise ApiError(400, "缺少成员 positions", "$.positions")
+        version = obj["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ApiError(400, "version 必须是整数", "$.version")
+        if version < 0:
+            raise ApiError(400, "version 必须是零基非负整数", "$.version")
+        parsed = _parse_positions(obj["positions"], "$.positions")
+
+        with self._write_lock.write():
+            conn = self._conn()
+            # 若上一次请求在改写中遭遇非强退异常而留下 pending，先补完再继续。
+            self._drain_pending_erasures(conn)
+            current = self._current_version(conn)
+            if version > current:
+                raise ApiError(400,
+                               f"version 越界：当前为 {current}，请求 {version}",
+                               "$.version")
+
+            # 引用校验：坐标须在该历史版本可见（文件当时存在、行界内、尚未删除）。
+            for i, (file_id, pos) in enumerate(parsed):
+                row = conn.execute(
+                    "SELECT nrows, created_ver, replaced_at FROM files WHERE id=?",
+                    (file_id,),
+                ).fetchone()
+                if row is None:
+                    raise ApiError(400, f"引用了不存在的文件 {file_id!r}",
+                                   _index_path("$.positions", i))
+                visible = (
+                    int(row["created_ver"]) <= version
+                    and (row["replaced_at"] is None or int(row["replaced_at"]) > version)
+                )
+                if not visible:
+                    raise ApiError(
+                        400,
+                        f"文件 {file_id!r} 在版本 {version} 不可见（当时尚未创建或已被替换）",
+                        _index_path("$.positions", i),
+                    )
+                if pos >= int(row["nrows"]):
+                    raise ApiError(
+                        400,
+                        f"pos={pos} 越界，文件 {file_id!r} 仅有 {row['nrows']} 行",
+                        _index_path("$.positions", i),
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM tombstones WHERE file=? AND pos=? AND del_ver<=?",
+                    (file_id, pos, version),
+                ).fetchone():
+                    raise ApiError(
+                        400,
+                        f"坐标 [{file_id!r}, {pos}] 在版本 {version} 不可见（已删除）",
+                        _index_path("$.positions", i),
+                    )
+
+            # 重复坐标合并；再按压实来源合并为逻辑行，得到去重的行数 N。
+            unique = list(dict.fromkeys(parsed))
+            components: list[set[tuple[str, int]]] = []
+            for file_id, pos in unique:
+                cells = self._identity_cells(conn, file_id, pos)
+                merged = set(cells)
+                kept: list[set[tuple[str, int]]] = []
+                for comp in components:
+                    if comp & merged:
+                        merged |= comp
+                    else:
+                        kept.append(comp)
+                kept.append(merged)
+                components = kept
+            erased = len(components)
+            cells_all: set[tuple[str, int]] = set()
+            for comp in components:
+                cells_all |= comp
+            if erased == 0:
+                return {"erased": 0}
+
+            # 先持久化擦除意图（pending + 全部物理单元格），此后才开始改写 Parquet；
+            # 意图提交前强退 => 完全未改写（原态）；提交后强退 => 启动时补完。
+            self._crash("erase_before_intent")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "INSERT INTO erasures (state, version, nrows, created_ver) "
+                    "VALUES ('pending', ?, ?, ?)",
+                    (version, erased, current),
+                )
+                erase_id = int(cur.lastrowid)
+                conn.executemany(
+                    "INSERT INTO erase_cells (erase_id, file, pos) VALUES (?, ?, ?)",
+                    [(erase_id, f, p) for f, p in sorted(cells_all)],
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                self._rollback(conn)
+                raise
+
+            self._apply_erase(conn, erase_id)
+
+        # 不增版本；重复请求重算同一逻辑行集合，返回相同的 N。
+        return {"erased": erased}
+
     # ------------------------------------------------------------------ 读取
     def read(self, obj: dict[str, Any]) -> dict[str, Any]:
         _require_members(obj, {"version"})
@@ -605,46 +924,59 @@ class Store:
             raise ApiError(400, "version 必须是整数", "$.version")
 
         conn = self._conn()
-        current = self._current_version(conn)
-        if version < 0 or version > current:
-            raise ApiError(400,
-                           f"version 越界：当前为 {current}，请求 {version}",
-                           "$.version")
+        while True:
+            # 持共享锁：读取与擦除/写完全串行等价。写者优先的 RW 锁使写者不会饥饿。
+            with self._write_lock.read():
+                # 持读锁时绝无写者/擦除进行中，故磁盘一致；但上次非强退异常可能遗留
+                # pending（部分文件尚未擦除，其中仍含原值）。检测到即放弃本次读取，
+                # 转去写锁下补完擦除再重试，保证读绝不泄露未完成的擦除。
+                if not conn.execute(
+                    "SELECT 1 FROM erasures WHERE state='pending' LIMIT 1"
+                ).fetchone():
+                    current = self._current_version(conn)
+                    if version < 0 or version > current:
+                        raise ApiError(400,
+                                       f"version 越界：当前为 {current}，请求 {version}",
+                                       "$.version")
 
-        # 单条只读事务保证快照一致（SQLite WAL 下不阻塞写者）
-        conn.execute("BEGIN")
-        try:
-            files = [
-                r["id"]
-                for r in conn.execute(
-                    "SELECT id FROM files "
-                    "WHERE created_ver<=? AND (replaced_at IS NULL OR replaced_at>?) "
-                    "ORDER BY id",
-                    (version, version),
-                )
-            ]
-            rows: list[dict[str, Any]] = []
-            for f in files:
-                dead = {
-                    r["pos"]
-                    for r in conn.execute(
-                        "SELECT pos FROM tombstones WHERE file=? AND del_ver<=?",
-                        (f, version),
-                    )
-                }
-                nrows = int(conn.execute(
-                    "SELECT nrows FROM files WHERE id=?", (f,)).fetchone()[0])
-                col = pq.read_table(self._file_path(f), columns=["value"]).column("value")
-                for pos in range(nrows):
-                    if pos in dead:
-                        continue
-                    rows.append({"file": f, "pos": pos, "value": col[pos].as_py()})
-            conn.execute("COMMIT")
-        except BaseException:
-            self._rollback(conn)
-            raise
-        # files 已按 id ASCII 序，行内按 pos 升序 -> 整体满足排序要求
-        return {"version": version, "rows": rows}
+                    # 单条只读事务保证快照一致（SQLite WAL 下不阻塞写者）
+                    conn.execute("BEGIN")
+                    try:
+                        files = [
+                            r["id"]
+                            for r in conn.execute(
+                                "SELECT id FROM files "
+                                "WHERE created_ver<=? AND (replaced_at IS NULL OR replaced_at>?) "
+                                "ORDER BY id",
+                                (version, version),
+                            )
+                        ]
+                        rows: list[dict[str, Any]] = []
+                        for f in files:
+                            dead = {
+                                r["pos"]
+                                for r in conn.execute(
+                                    "SELECT pos FROM tombstones WHERE file=? AND del_ver<=?",
+                                    (f, version),
+                                )
+                            }
+                            nrows = int(conn.execute(
+                                "SELECT nrows FROM files WHERE id=?", (f,)).fetchone()[0])
+                            col = pq.read_table(
+                                self._file_path(f), columns=["value"]).column("value")
+                            for pos in range(nrows):
+                                if pos in dead:
+                                    continue
+                                rows.append({"file": f, "pos": pos, "value": col[pos].as_py()})
+                        conn.execute("COMMIT")
+                    except BaseException:
+                        self._rollback(conn)
+                        raise
+                    # files 已按 id ASCII 序，行内按 pos 升序 -> 整体满足排序要求
+                    return {"version": version, "rows": rows}
+
+            with self._write_lock.write():
+                self._drain_pending_erasures(conn)
 
 
 # ---------------------------------------------------------------------- HTTP 层
@@ -671,6 +1003,7 @@ class Handler(BaseHTTPRequestHandler):
             "/delete": self.store.delete,
             "/prepare": self.store.prepare,
             "/publish": self.store.publish,
+            "/erase": self.store.erase,
             "/read": self.store.read,
         }.get(self.path)
         if route is None:

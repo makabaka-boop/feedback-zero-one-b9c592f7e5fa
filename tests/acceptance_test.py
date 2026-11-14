@@ -595,6 +595,473 @@ def test_concurrency() -> None:
         shutil.rmtree(data, ignore_errors=True)
 
 
+# ---------------------------------------------------------------- 11. 擦除
+def test_erase_validation() -> None:
+    section("11. 擦除：请求校验（400，拒绝无副作用）")
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_val_")
+    try:
+        srv = Server(data)
+        srv.post("/append", {"file": "a", "values": [7, 7]})
+        srv.post("/delete", {"positions": [["a", 1]]})
+        base = srv.post("/read", {"version": 2})[1]
+        parquet_before = {
+            p.name: p.read_bytes() for p in (Path(data) / "parquet").iterdir()
+        }
+
+        expect_error(srv, "/erase", None, 400, "坏 JSON 语法", raw=b"{not json")
+        # 重复成员
+        code, _ = srv.post("/erase", None,
+                           raw=b'{"version":1,"version":1,"positions":[]}')
+        check(code == 400, "擦除重复成员 -> 400")
+        expect_error(srv, "/erase", {"version": 1, "positions": [], "x": 1}, 400,
+                     "擦除未知成员")
+        expect_error(srv, "/erase", {"positions": []}, 400, "缺少 version")
+        expect_error(srv, "/erase", {"version": 1}, 400, "缺少 positions")
+        expect_error(srv, "/erase", {"version": True, "positions": []}, 400,
+                     "version 布尔拒绝")
+        expect_error(srv, "/erase", {"version": "1", "positions": []}, 400,
+                     "version 类型错误")
+        expect_error(srv, "/erase", {"version": -1, "positions": []}, 400,
+                     "version 负数")
+        expect_error(srv, "/erase", {"version": 99, "positions": []}, 400,
+                     "version 未达（未来版本）")
+        expect_error(srv, "/erase", {"version": 1, "positions": "x"}, 400,
+                     "positions 非数组")
+        expect_error(srv, "/erase", {"version": 1, "positions": [["a"]]}, 400,
+                     "位置项长度错误")
+        expect_error(srv, "/erase", {"version": 1, "positions": [[1, 0]]}, 400,
+                     "位置项 file 类型错误")
+        expect_error(srv, "/erase", {"version": 1, "positions": [["a", True]]}, 400,
+                     "位置项 pos 布尔拒绝")
+        expect_error(srv, "/erase", {"version": 1, "positions": [["a", -1]]}, 400,
+                     "位置项 pos 负数")
+        expect_error(srv, "/erase", {"version": 1, "positions": [["nope", 0]]}, 400,
+                     "引用不存在文件")
+        expect_error(srv, "/erase", {"version": 1, "positions": [["a", 5]]}, 400,
+                     "pos 越界")
+        expect_error(srv, "/erase", {"version": 2, "positions": [["a", 1]]}, 400,
+                     "在该版本已删除的坐标不可擦除")
+
+        check(srv.post("/read", {"version": 2})[1] == base,
+              "全部拒绝后读取状态不变")
+        parquet_after = {
+            p.name: p.read_bytes() for p in (Path(data) / "parquet").iterdir()
+        }
+        check(parquet_after == parquet_before, "全部拒绝后 Parquet 文件逐字节不变")
+        # 版本未被推进
+        check(srv.post("/read", {"version": 3})[0] == 400, "拒绝的擦除不增版本")
+        srv.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_erase_spec_example() -> None:
+    section("12. 擦除：规格示例 a=[7,7] 压实为 ~j 后擦除 [a,0]")
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_spec_")
+    try:
+        srv = Server(data)
+        srv.post("/append", {"file": "a", "values": [7, 7]})       # v1
+        srv.post("/prepare", {"job": "j", "files": ["a"]})          # base=1
+        srv.post("/publish", {"job": "j"})                          # v2
+        # 历史版本 1 可见 a；当前版本 2 可见 ~j
+        code, body = srv.post("/erase", {"version": 1, "positions": [["a", 0]]})
+        check(code == 200 and body == {"erased": 1},
+              f"擦除 [a,0] -> {{'erased':1}}（实际 {code} {body}）")
+
+        # 历史 a 原值被擦除，当前 ~j 的对应行也被擦除；同值其他行保持
+        hist = srv.post("/read", {"version": 1})[1]
+        check(hist["rows"] == [
+            {"file": "a", "pos": 0, "value": None},
+            {"file": "a", "pos": 1, "value": 7},
+        ], f"历史 a 值为 [null,7]（实际 {hist['rows']}）")
+        cur = srv.post("/read", {"version": 2})[1]
+        check(cur["rows"] == [
+            {"file": "~j", "pos": 0, "value": None},
+            {"file": "~j", "pos": 1, "value": 7},
+        ], f"当前 ~j 值为 [null,7]（实际 {cur['rows']}）")
+
+        # 仅改写目标单元格：直接读 Parquet，同值其他行仍为 7
+        import pyarrow.parquet as pq
+        a_vals = pq.read_table(Path(data) / "parquet" / "a.parquet").column(
+            "value").to_pylist()
+        j_vals = pq.read_table(Path(data) / "parquet" / "~j.parquet").column(
+            "value").to_pylist()
+        check(a_vals == [None, 7], f"a.parquet 解码为 [None,7]（实际 {a_vals}）")
+        check(j_vals == [None, 7], f"~j.parquet 解码为 [None,7]（实际 {j_vals}）")
+
+        # 不增版本
+        check(srv.post("/read", {"version": 3})[0] == 400, "擦除不增版本（当前仍为 2）")
+
+        # 重试结果相同（幂等），且返回相同的 N
+        code2, body2 = srv.post("/erase", {"version": 1, "positions": [["a", 0]]})
+        check(code2 == 200 and body2 == {"erased": 1},
+              f"重试返回相同 {{'erased':1}}（实际 {body2}）")
+        check(srv.post("/read", {"version": 2})[1] == cur, "重试不改变状态")
+        # 以当前坐标同样可擦除同一逻辑行（已按来源识别为同一行）
+        code3, body3 = srv.post("/erase", {"version": 2, "positions": [["~j", 0]]})
+        check(code3 == 200 and body3 == {"erased": 1},
+              f"经 ~j 坐标擦除同一逻辑行 -> erased 1（实际 {body3}）")
+        srv.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_erase_chained_and_pending() -> None:
+    section("13. 擦除：链式压实、未发布副本、同值不同行")
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_chain_")
+    try:
+        srv = Server(data)
+        # 两个文件同值，验证同值其他行不受影响
+        srv.post("/append", {"file": "s1", "values": [7, 8]})       # v1
+        srv.post("/append", {"file": "s2", "values": [7, 9]})       # v2
+        srv.post("/prepare", {"job": "j1", "files": ["s1", "s2"]})  # 合并 [7,8,7,9]
+        srv.post("/publish", {"job": "j1"})                          # v3
+        # 对已发布输出再次准备一个未发布作业 j2（待定副本）
+        srv.post("/prepare", {"job": "j2", "files": ["~j1"]})        # 不增版本
+        # 链式第二轮也已发布的情形用 j3 覆盖
+        srv.post("/prepare", {"job": "j3", "files": ["~j1"]})
+        # 先发布 j3 -> v4，再准备 j2（~j1 已被 j3 替换会 409，故 j2 在发布前已准备）
+        # 说明：j2 保持 prepared 未发布，作为“待定发布副本”用例。
+
+        # 擦除逻辑行：s1 pos0（值7）通过 s1 -> ~j1 pos0 -> {~j2 pos0, ~j3 pos0} 传播
+        code, body = srv.post("/erase", {"version": 1, "positions": [["s1", 0]]})
+        check(code == 200 and body == {"erased": 1},
+              f"擦除 s1/0 一个逻辑行 -> erased 1（实际 {body}）")
+
+        import pyarrow.parquet as pq
+        def vals(name):
+            return pq.read_table(Path(data) / "parquet" / name).column(
+                "value").to_pylist()
+        check(vals("s1.parquet") == [None, 8], f"s1 原值擦除（实际 {vals('s1.parquet')}）")
+        check(vals("~j1.parquet") == [None, 8, 7, 9],
+              f"~j1 仅目标槽置 null，同值 7 在 pos2 保留（实际 {vals('~j1.parquet')}）")
+        check(vals("~j2.parquet") == [None, 8, 7, 9],
+              f"未发布的 ~j2 副本同步擦除（实际 {vals('~j2.parquet')}）")
+        check(vals("~j3.parquet") == [None, 8, 7, 9],
+              f"另一待定副本 ~j3 同步擦除（实际 {vals('~j3.parquet')}）")
+
+        # 发布待定作业：原值不会复活（该行值已是 null），同值其他行保留
+        _, pub2 = srv.post("/publish", {"job": "j2"})
+        rows2 = srv.post("/read", {"version": pub2["version"]})[1]["rows"]
+        j2 = [r for r in rows2 if r["file"] == "~j2"]
+        check(j2 == [
+            {"file": "~j2", "pos": 0, "value": None},
+            {"file": "~j2", "pos": 1, "value": 8},
+            {"file": "~j2", "pos": 2, "value": 7},
+            {"file": "~j2", "pos": 3, "value": 9},
+        ], f"发布 ~j2 后目标行为 null（不复活），同值 pos2=7 保留（实际 {j2}）")
+
+        # 历史版本仍可读，且历史中被擦除行确为 null
+        h1 = srv.post("/read", {"version": 1})[1]["rows"]
+        check(h1 == [{"file": "s1", "pos": 0, "value": None},
+                     {"file": "s1", "pos": 1, "value": 8}],
+              f"历史 v1 的 s1 已被擦除（实际 {h1}）")
+        h2 = srv.post("/read", {"version": 2})[1]["rows"]
+        check(h2 == [{"file": "s1", "pos": 0, "value": None},
+                     {"file": "s1", "pos": 1, "value": 8},
+                     {"file": "s2", "pos": 0, "value": 7},
+                     {"file": "s2", "pos": 1, "value": 9}],
+              f"同值其他文件 s2 不受影响（实际 {h2}）")
+        srv.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_erase_multi_and_empty() -> None:
+    section("14. 擦除：多坐标去重、空数组合法、跨文件同源合并")
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_multi_")
+    try:
+        srv = Server(data)
+        srv.post("/append", {"file": "p", "values": [1, 2]})   # v1
+        srv.post("/append", {"file": "q", "values": [3, 4]})   # v2
+        srv.post("/prepare", {"job": "m", "files": ["p", "q"]})  # ~m = [1,2,3,4]
+        srv.post("/publish", {"job": "m"})                       # v3
+
+        # 空数组合法：返回 erased 0，不增版本
+        code, body = srv.post("/erase", {"version": 3, "positions": []})
+        check(code == 200 and body == {"erased": 0},
+              f"空 positions 合法 -> {{'erased':0}}（实际 {code} {body}）")
+        check(srv.post("/read", {"version": 4})[0] == 400, "空擦除不增版本")
+
+        # 重复坐标合并；跨文件同源坐标（p/0 与 ~m/0）也合并为同一逻辑行
+        code, body = srv.post("/erase", {
+            "version": 1,
+            "positions": [["p", 0], ["p", 0]],
+        })
+        check(code == 200 and body == {"erased": 1},
+              f"重复坐标合并 -> erased 1（实际 {body}）")
+        code, body = srv.post("/erase", {
+            "version": 2,
+            "positions": [["p", 1], ["q", 0]],
+        })
+        check(code == 200 and body == {"erased": 2},
+              f"两个不同逻辑行 -> erased 2（实际 {body}）")
+        # 跨版本不可见坐标 -> 400
+        code, body = srv.post("/erase", {
+            "version": 1,
+            "positions": [["p", 0], ["~m", 0]],
+        })
+        # 版本 1 中 ~m 尚不存在 -> 引用错误 400
+        check(code == 400, f"跨版本不可见坐标 -> 400（实际 {code} {body}）")
+        code, body = srv.post("/erase", {
+            "version": 3,
+            "positions": [["p", 0], ["~m", 0]],
+        })
+        # 版本 3 中 p 已被替换 -> 引用错误 400
+        check(code == 400, f"已被替换文件在 v3 不可见 -> 400（实际 {code} {body}）")
+        # 已在 v2 擦除 p/1 与 q/0，相应的 ~m 槽位（2、3）已为 null；
+        # 再对 v3 的 ~m/0、~m/1 擦除，去重后为 2 行
+        code, body = srv.post("/erase", {
+            "version": 3, "positions": [["~m", 0], ["~m", 0], ["~m", 1]],
+        })
+        check(code == 200 and body == {"erased": 2},
+              f"当前压实文件多坐标去重 -> erased 2（实际 {body}）")
+
+        import pyarrow.parquet as pq
+        m = pq.read_table(Path(data) / "parquet" / "~m.parquet").column(
+            "value").to_pylist()
+        check(m == [None, None, None, 4],
+              f"~m 前两槽为本次擦除，pos2 为 v2 已擦除的 p/1（实际 {m}）")
+        # 擦除只把值置 null，不改变可见性：被擦除的行仍以 null 返回
+        mrows = srv.post("/read", {"version": 3})[1]["rows"]
+        check(mrows == [
+            {"file": "~m", "pos": 0, "value": None},
+            {"file": "~m", "pos": 1, "value": None},
+            {"file": "~m", "pos": 2, "value": None},
+            {"file": "~m", "pos": 3, "value": 4},
+        ], f"被擦除行仍可见且为 null（pos 2 亦在 v2 已擦除）（实际 {mrows}）")
+        srv.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_erase_crash_recovery() -> None:
+    section("15. 擦除：强退恢复（意图前 / 意图后 / 逐文件改写中 / 改写后置done前）")
+
+    # 15a. 擦除意图持久化前强退 -> 原态完整保留（未擦除），重启可重新擦除
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_preintent_")
+    try:
+        srv = Server(data, crash="erase_before_intent")
+        srv.post("/append", {"file": "u", "values": [4, 4]})
+        srv.post("/prepare", {"job": "uj", "files": ["u"]})
+        srv.post("/publish", {"job": "uj"})
+        srv.post_expect_crash("/erase", {"version": 1, "positions": [["u", 0]]})
+        srv.hard_kill()
+        time.sleep(0.3)
+        srv2 = Server(data)
+        import pyarrow.parquet as pq
+        for name in ("u.parquet", "~uj.parquet"):
+            v = pq.read_table(Path(data) / "parquet" / name).column(
+                "value").to_pylist()
+            check(v == [4, 4], f"意图前强退：{name} 原值保留（实际 {v}）")
+        # 原态保留，之后可正常完成擦除
+        _, body = srv2.post("/erase", {"version": 1, "positions": [["u", 0]]})
+        check(body == {"erased": 1}, f"重启后可完成擦除（实际 {body}）")
+        check(pq.read_table(Path(data) / "parquet" / "u.parquet").column(
+            "value").to_pylist() == [None, 4], "延迟擦除结果正确")
+        srv2.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+    # 15b. 意图提交后、改写前强退：重启必须先补完擦除才服务
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_crash_")
+    try:
+        srv = Server(data, crash="erase_after_intent")
+        srv.post("/append", {"file": "e", "values": [5, 5]})
+        srv.post("/prepare", {"job": "ej", "files": ["e"]})
+        srv.post("/publish", {"job": "ej"})
+        srv.post_expect_crash("/erase", {"version": 1, "positions": [["e", 0]]})
+        srv.hard_kill()
+        time.sleep(0.3)
+        # 重启：必须先补完擦除才服务
+        srv2 = Server(data)
+        hist = srv2.post("/read", {"version": 1})[1]["rows"]
+        check(hist == [{"file": "e", "pos": 0, "value": None},
+                       {"file": "e", "pos": 1, "value": 5}],
+              f"意图后强退：重启已完成擦除（历史 e 值 {hist}）")
+        cur = srv2.post("/read", {"version": 2})[1]["rows"]
+        check(cur == [{"file": "~ej", "pos": 0, "value": None},
+                      {"file": "~ej", "pos": 1, "value": 5}],
+              f"意图后强退：当前 ~ej 也已擦除（实际 {cur}）")
+        import pyarrow.parquet as pq
+        for name in ("e.parquet", "~ej.parquet"):
+            v = pq.read_table(Path(data) / "parquet" / name).column(
+                "value").to_pylist()
+            check(v == [None, 5], f"{name} 解码 [None,5]（实际 {v}）")
+        srv2.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+    # 15b. 逐文件改写中强退（多文件逐个改写，中途退出）：重启补完
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_mid_")
+    try:
+        srv = Server(data, crash="erase_mid_rewrite")
+        srv.post("/append", {"file": "f1", "values": [1, 2]})   # v1
+        srv.post("/prepare", {"job": "tmpj", "files": ["f1"]})  # 仅占位，不发布
+        srv.post("/append", {"file": "f2", "values": [3, 4]})   # v2
+        srv.post("/prepare", {"job": "mj", "files": ["f1", "f2"]})
+        srv.post("/publish", {"job": "mj"})                     # v3；~mj 继承两输入
+        # f1、f2 在 v2 同时可见（~mj 尚未发布，但仍作为后代副本被擦除）
+        srv.post_expect_crash("/erase", {
+            "version": 2,
+            "positions": [["f1", 0], ["f2", 0]],
+        })
+        srv.hard_kill()
+        time.sleep(0.3)
+        srv2 = Server(data)
+        import pyarrow.parquet as pq
+        f1 = pq.read_table(Path(data) / "parquet" / "f1.parquet").column(
+            "value").to_pylist()
+        f2 = pq.read_table(Path(data) / "parquet" / "f2.parquet").column(
+            "value").to_pylist()
+        mj = pq.read_table(Path(data) / "parquet" / "~mj.parquet").column(
+            "value").to_pylist()
+        check(f1 == [None, 2] and f2 == [None, 4],
+              f"改写中强退：两输入端均已擦除（f1={f1} f2={f2}）")
+        check(mj == [None, 2, None, 4],
+              f"改写中强退：压实输出同步擦除（~mj={mj}）")
+        # 恢复后重试返回相同 N
+        _, body = srv2.post("/erase", {"version": 2, "positions": [["f1", 0]]})
+        check(body == {"erased": 1}, f"恢复后重试 erased 1（实际 {body}）")
+        srv2.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+    # 15c. 改写完成、置 done 前强退：重启补完标记，结果不变
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_post_")
+    try:
+        srv = Server(data, crash="erase_after_rewrites")
+        srv.post("/append", {"file": "g", "values": [6, 6, 6]})
+        srv.post_expect_crash("/erase", {"version": 1, "positions": [["g", 1]]})
+        srv.hard_kill()
+        time.sleep(0.3)
+        srv2 = Server(data)
+        import pyarrow.parquet as pq
+        g = pq.read_table(Path(data) / "parquet" / "g.parquet").column(
+            "value").to_pylist()
+        check(g == [6, None, 6], f"改写后强退：仅目标槽 null（实际 {g}）")
+        rows = srv2.post("/read", {"version": 1})[1]["rows"]
+        check(rows == [
+            {"file": "g", "pos": 0, "value": 6},
+            {"file": "g", "pos": 1, "value": None},
+            {"file": "g", "pos": 2, "value": 6},
+        ], f"读取值正确且坐标不变（实际 {rows}）")
+        _, body = srv2.post("/erase", {"version": 1, "positions": [["g", 1]]})
+        check(body == {"erased": 1}, "恢复后重试幂等")
+        srv2.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_erase_interleaved_and_future() -> None:
+    section("17. 擦除：交错删除后擦除 + 擦除后的新压实不复活原值")
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_inter_")
+    try:
+        import pyarrow.parquet as pq
+        srv = Server(data)
+        srv.post("/append", {"file": "h", "values": [7, 7, 9]})    # v1
+        srv.post("/delete", {"positions": [["h", 0]]})             # v2（pos0 死）
+        srv.post("/prepare", {"job": "hj", "files": ["h"]})        # ~hj=[null,7,9]
+        srv.post("/publish", {"job": "hj"})                        # v3
+
+        # 以版本 1 擦除 [h,0]：该坐标在 v1 可见（删除发生于 v2）
+        code, body = srv.post("/erase", {"version": 1, "positions": [["h", 0]]})
+        check(code == 200 and body == {"erased": 1},
+              f"交错删除前历史坐标可擦除 -> erased 1（实际 {code} {body}）")
+        # 历史 h、当前 ~hj 的目标行均置 null；其余坐标不变
+        h = pq.read_table(Path(data) / "parquet" / "h.parquet").column(
+            "value").to_pylist()
+        hj = pq.read_table(Path(data) / "parquet" / "~hj.parquet").column(
+            "value").to_pylist()
+        check(h == [None, 7, 9], f"h 原值擦除、同值 pos1 保留（实际 {h}）")
+        check(hj == [None, 7, 9], f"~hj 目标槽 null、其余保留（实际 {hj}）")
+        # 删除可见性保持：v1 两行均可见（pos0 为 null），v3 仅 pos1/2
+        v1 = srv.post("/read", {"version": 1})[1]["rows"]
+        check(v1 == [
+            {"file": "h", "pos": 0, "value": None},
+            {"file": "h", "pos": 1, "value": 7},
+            {"file": "h", "pos": 2, "value": 9},
+        ], f"v1 删除可见性不变（pos0 仍可见为 null）（实际 {v1}）")
+        v3 = srv.post("/read", {"version": 3})[1]["rows"]
+        check(v3 == [
+            {"file": "~hj", "pos": 1, "value": 7},
+            {"file": "~hj", "pos": 2, "value": 9},
+        ], f"v3 已删除的 pos0 仍不可见（实际 {v3}）")
+
+        # 擦除后进行新一轮压实：新输出必须继承 null，绝不复活原值
+        srv.post("/prepare", {"job": "hk", "files": ["~hj"]})      # 空操作不增版
+        _, pub = srv.post("/publish", {"job": "hk"})
+        v4 = srv.post("/read", {"version": pub["version"]})[1]["rows"]
+        check(v4 == [
+            {"file": "~hk", "pos": 1, "value": 7},
+            {"file": "~hk", "pos": 2, "value": 9},
+        ], f"擦除后压实继承 null（pos0 死且原值不复活）（实际 {v4}）")
+        hk = pq.read_table(Path(data) / "parquet" / "~hk.parquet").column(
+            "value").to_pylist()
+        check(hk == [None, 7, 9], f"新输出 ~hk 物理值 [None,7,9]（实际 {hk}）")
+        srv.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
+def test_erase_concurrency() -> None:
+    section("16. 擦除：与写/读并发时串行等价")
+    data = tempfile.mkdtemp(prefix="lakecomp_erase_conc_")
+    try:
+        srv = Server(data)
+        srv.post("/append", {"file": "c", "values": list(range(20))})
+        srv.post("/prepare", {"job": "cj", "files": ["c"]})
+        srv.post("/publish", {"job": "cj"})
+
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def eraser():
+            try:
+                for k in range(0, 20, 2):
+                    code, b = srv.post("/erase", {"version": 2, "positions": [["~cj", k]]})
+                    if code != 200:
+                        with lock:
+                            errors.append(f"erase {k}: {b}")
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append(str(e))
+
+        def reader():
+            try:
+                for _ in range(20):
+                    code, b = srv.post("/read", {"version": 2})
+                    if code != 200:
+                        with lock:
+                            errors.append(f"read: {b}")
+                        continue
+                    # 读到的快照形状必须始终完整（20 行，坐标连续）
+                    if [r["pos"] for r in b["rows"]] != list(range(20)):
+                        with lock:
+                            errors.append("读取到形状不完整的中间态")
+            except Exception as e:  # noqa: BLE001
+                with lock:
+                    errors.append(str(e))
+
+        threads = [threading.Thread(target=eraser), threading.Thread(target=reader),
+                   threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check(not errors, f"擦除与读并发无错误、无中间态（{errors[:3]}）")
+
+        import pyarrow.parquet as pq
+        c = pq.read_table(Path(data) / "parquet" / "~cj.parquet").column(
+            "value").to_pylist()
+        check(c == [None if i % 2 == 0 else i for i in range(20)],
+              f"偶数槽全部擦除、奇数槽保留（实际 {c}）")
+        check(srv.post("/read", {"version": 3})[0] == 400, "并发擦除不增版本")
+        srv.stop()
+    finally:
+        shutil.rmtree(data, ignore_errors=True)
+
+
 def main() -> int:
     base_data = tempfile.mkdtemp(prefix="lakecomp_main_")
     try:
@@ -610,6 +1077,13 @@ def main() -> int:
         test_concurrency()
         test_pre_prepare_delete_and_nulls()
         test_chained_compaction()
+        test_erase_validation()
+        test_erase_spec_example()
+        test_erase_chained_and_pending()
+        test_erase_multi_and_empty()
+        test_erase_crash_recovery()
+        test_erase_interleaved_and_future()
+        test_erase_concurrency()
     finally:
         shutil.rmtree(base_data, ignore_errors=True)
 
